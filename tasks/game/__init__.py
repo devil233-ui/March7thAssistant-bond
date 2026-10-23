@@ -16,6 +16,7 @@ from module.game.cloud import CloudGameLoginTimeoutError
 from module.logger import log
 from module.screen import screen
 from module.automation import auto
+from module.automation.screenshot import Screenshot
 from module.config import cfg
 from module.notification import notif
 from module.notification.notification import NotificationLevel
@@ -27,6 +28,14 @@ from utils.console import is_gui_started
 
 class GameClientOutdatedError(RuntimeError):
     """游戏客户端版本过低（供 except 类型判断，勿用文本匹配异常消息）。"""
+
+
+class GameWindowNotReadyError(RuntimeError):
+    """游戏窗口存在但长时间无法截图（仍在加载，或停在登录/「点击进入」界面）。
+
+    这类情况游戏本身没坏，不该强杀重启：上层捕获后直接终止并提示用户处理，
+    避免把「停在登录界面」误判成「启动失败」→ 反复杀进程重开。
+    """
 
 
 def wait_until(condition, timeout, period=1):
@@ -71,48 +80,103 @@ def ensure_game_ready():
 def start_game():
     MAX_RETRY = 3
 
+    def _try(fn, *args, **kwargs):
+        """容错执行一次画面操作。
+
+        游戏刚启动/正在加载时窗口可能还截不到图（pyautogui 只认可见窗口），
+        此时 auto.take_screenshot 会抛「截图超时」。过去这种异常会一路冒泡，
+        整轮启动被判定为失败并强杀重启游戏；这里改成当作「本次没点到」，
+        交给外层的等待循环继续重试。
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            log.debug(f"画面操作暂未完成（窗口可能仍在加载），稍后重试：{e}")
+            return False
+
+    def _window_capturable():
+        """游戏窗口当前是否可截到图（窗口存在且可见）。"""
+        try:
+            return bool(Screenshot.get_window(cfg.game_title_name))
+        except Exception:
+            return False
+
+    def _is_main_screen_ready(timeout=10):
+        """短暂尝试识别游戏主界面，识别不到返回 False。"""
+        def probe():
+            try:
+                return bool(screen.get_current_screen(autotry=False, max_retries=1))
+            except Exception:
+                return False
+        return wait_until(probe, timeout)
+
+    def ensure_in_game(already_running: bool):
+        """确保游戏窗口从「已启动/停在登录界面」走到可操作的游戏主界面。
+
+        already_running=True 表示调用前窗口已存在：这种情况可能是玩家上次停在
+        登录/「点击进入」界面，必须先确认是否已进大厅，没进就补点「进入」，
+        否则后续流程只会一直等主界面直到超时。
+        """
+        # 窗口句柄存在 ≠ 画面可截：游戏刚创建窗口时往往是不可见状态，
+        # pyautogui（pygetwindow）只枚举可见窗口，过早截图只会得到「没有找到游戏窗口」。
+        if not wait_until(_window_capturable, 180):
+            raise GameWindowNotReadyError(
+                "游戏窗口已存在但长时间无法截图（可能仍在加载，或停在登录界面等待操作）"
+            )
+
+        if already_running and _is_main_screen_ready(10):
+            log.debug("游戏已在主界面，无需点击进入")
+            return
+
+        if not wait_until(lambda: check_and_click_enter(), cfg.start_game_timeout * 60):
+            raise TimeoutError("查找并点击进入按钮超时")
+
+        time.sleep(10)
+        # 修复B服问题 https://github.com/moesnow/March7thAssistant/discussions/321#discussioncomment-10565807
+        auto.press_mouse()
+
     def check_and_click_enter():
         # 点击进入
-        if auto.click_element("./assets/images/screen/click_enter.png", "image", 0.9):
+        if _try(auto.click_element, "./assets/images/screen/click_enter.png", "image", 0.9):
             return True
         # 游戏热更新，需要确认重启
-        auto.click_element("./assets/images/zh_CN/base/confirm.png", "image", 0.9, take_screenshot=False)
+        _try(auto.click_element, "./assets/images/zh_CN/base/confirm.png", "image", 0.9, take_screenshot=False)
         # 网络异常等问题，需要重新启动
-        auto.click_element("./assets/images/zh_CN/base/restart.png", "image", 0.9, take_screenshot=False)
+        _try(auto.click_element, "./assets/images/zh_CN/base/restart.png", "image", 0.9, take_screenshot=False)
         # 适配国际服，需要点击“开始游戏”
-        auto.click_element("./assets/images/screen/start_game.png", "image", 0.9, take_screenshot=False)
+        _try(auto.click_element, "./assets/images/screen/start_game.png", "image", 0.9, take_screenshot=False)
         # 出现多账号登录页时，需要点击“登录其他账号”
-        auto.click_element("./assets/images/screen/login_switch_account.png", "image", 0.9, take_screenshot=False)
+        _try(auto.click_element, "./assets/images/screen/login_switch_account.png", "image", 0.9, take_screenshot=False)
         # 适配用户协议和隐私政策更新提示，需要点击“同意”
-        auto.click_element("./assets/images/screen/agree_update.png", "image", 0.9, take_screenshot=False)
+        _try(auto.click_element, "./assets/images/screen/agree_update.png", "image", 0.9, take_screenshot=False)
         # 登录过期
-        if auto.find_element("./assets/images/screen/account_and_password.png", "image", 0.9, take_screenshot=False):
+        if _try(auto.find_element, "./assets/images/screen/account_and_password.png", "image", 0.9, take_screenshot=False):
             if load_acc_and_pwd(gamereg_uid()) != (None, None):
                 log.info("检测到登录过期，尝试自动登录")
                 auto_login()
             else:
                 raise PermissionError("账号登录过期")
-        if auto.find_element("./assets/images/screen/password_field.png", "image", 0.9, take_screenshot=False):
+        if _try(auto.find_element, "./assets/images/screen/password_field.png", "image", 0.9, take_screenshot=False):
             if load_acc_and_pwd(gamereg_uid()) != (None, None):
                 log.info("检测到登录过期，尝试自动登录")
                 auto_login_os()
         # 游戏已有新版本，请前往启动器下载最新客户端，完成本次更新后登录游戏即可获
         # 得300星琼奖励。
-        if auto.find_element("前往启动器下载最新客户端", "text", take_screenshot=False, include=True):
+        if _try(auto.find_element, "前往启动器下载最新客户端", "text", take_screenshot=False, include=True):
             raise GameClientOutdatedError(tr("检测到游戏客户端版本过低，请前往启动器下载最新客户端"))
 
         # 适配B服，需要点击“登录”，强制使用前台截图方式（#901）
-        if auto.find_element(("bilibili游戏隐私政策提示", "登录记录"), "text", use_background_screenshot=False):
+        if _try(auto.find_element, ("bilibili游戏隐私政策提示", "登录记录"), "text", use_background_screenshot=False):
             if auto.matched_text == "bilibili游戏隐私政策提示":
-                auto.click_element("同意", "text", take_screenshot=False)
+                _try(auto.click_element, "同意", "text", take_screenshot=False)
             elif auto.matched_text == "登录记录":
-                auto.click_element("登录", "text", take_screenshot=False)
+                _try(auto.click_element, "登录", "text", take_screenshot=False)
         else:
-            auto.click_element("./assets/images/screen/bilibili_login.png", "image", 0.9, take_screenshot=False)
-            auto.click_element("./assets/images/screen/bilibili_login_2.png", "image", 0.9, take_screenshot=False)
-            auto.click_element("./assets/images/screen/bilibili_login_3.png", "image", 0.9, take_screenshot=False)
-            auto.click_element("./assets/images/screen/bilibili_agree_update.png", "image", 0.9, take_screenshot=False)
-            auto.click_element("./assets/images/screen/bilibili_agree_update_2.png", "image", 0.9, take_screenshot=False)
+            _try(auto.click_element, "./assets/images/screen/bilibili_login.png", "image", 0.9, take_screenshot=False)
+            _try(auto.click_element, "./assets/images/screen/bilibili_login_2.png", "image", 0.9, take_screenshot=False)
+            _try(auto.click_element, "./assets/images/screen/bilibili_login_3.png", "image", 0.9, take_screenshot=False)
+            _try(auto.click_element, "./assets/images/screen/bilibili_agree_update.png", "image", 0.9, take_screenshot=False)
+            _try(auto.click_element, "./assets/images/screen/bilibili_agree_update_2.png", "image", 0.9, take_screenshot=False)
 
         return False
 
@@ -183,15 +247,10 @@ def start_game():
             # starrail.check_resolution_ratio(1920, 1080)
             starrail.check_resolution(1920, 1080)
 
-            if not wait_until(lambda: check_and_click_enter(), cfg.start_game_timeout * 60):
-                raise TimeoutError("查找并点击进入按钮超时")
+            ensure_in_game(already_running=False)
 
             # 偶现加载慢时分辨率修改不成功，进入游戏前增加一次分辨率检查
             starrail.check_resolution(1920, 1080)
-
-            time.sleep(10)
-            # 修复B服问题 https://github.com/moesnow/March7thAssistant/discussions/321#discussioncomment-10565807
-            auto.press_mouse()
         else:
             # starrail.check_resolution_ratio(1920, 1080)
             starrail.check_resolution(1920, 1080)
@@ -201,6 +260,9 @@ def start_game():
                     cfg.set_value("game_path", program_path)
                     log.info(f"游戏路径更新成功：{program_path}")
             time.sleep(1)
+            # 窗口已存在不等于已进大厅：可能停在登录/「点击进入」界面，
+            # 过去这条分支只查分辨率就直接往下走，结果一路等到主界面超时。
+            ensure_in_game(already_running=True)
 
     def start_cloud_game():
         if not cloud_game.start_game_process():
@@ -229,7 +291,9 @@ def start_game():
                     starrail.stop_game()
                 continue
             break
-        except CloudGameLoginTimeoutError:
+        except (CloudGameLoginTimeoutError, GameWindowNotReadyError):
+            # 云游戏登录超时、或游戏窗口长时间不可用（仍在加载/停在登录界面）：
+            # 游戏本身没坏，强杀重开只会打断玩家已完成的登录，直接交给上层提示处理。
             raise
         except Exception as e:
             log.error(f"尝试启动游戏时发生错误：{e}")

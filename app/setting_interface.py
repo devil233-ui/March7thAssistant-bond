@@ -598,7 +598,7 @@ class SettingInterface(ScrollArea):
             UiIcon.GAUGE,
             tr('职级难度'),
             '',
-            texts={tr('最高职级'): 'highest', tr('当前职级'): 'current', tr('最低职级'): 'lowest'}
+            texts={tr('最高职级'): 'highest', tr('当前职级'): 'current', tr('最低职级'): 'lowest', tr('紫金职级（敌人难度30）'): 'purple'}
         )
         self.currencywarsStrategyCard = ExpandableComboBoxSettingCard(
             "currencywars_strategy",

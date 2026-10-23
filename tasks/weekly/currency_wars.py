@@ -6,6 +6,7 @@ from module.notification.notification import NotificationLevel
 from tasks.base.base import Base
 from utils.date import Date
 from tasks.weekly.weekly_reward import wait_for_weekly_reward
+from tasks.weekly.currency_wars_bond import bond_chain_step
 from typing import Literal, Tuple, Optional
 import numpy as np
 import time
@@ -32,6 +33,7 @@ class CurrencyWars:
         self.result: Optional[bool] = None  # 对局结果
         self.need_exit: bool = False  # 是否需要退出
         self.need_restart: bool = False  # 是否重开
+        self.bond_target: Optional[str] = None  # 羁绊策略：本局要凑的主羁绊（投资环境择优选它）
         self._stage_unchanged_count: int = 0  # 连续未发生阶段变化计数
         self._unrecognized_stage_count: int = 0  # 连续未识别阶段计数
         self.forward_characters: list[CurrencyWarsCharacter] = []  # 存储前台角色
@@ -440,6 +442,8 @@ class CurrencyWars:
                 else:
                     break
             return True
+        elif cfg.currencywars_rank_difficulty == "purple":
+            return self.choose_purple_level()
         else:
             # pos = auto.find_element("./assets/images/screen/currency_wars/level_down.png", "image", 100000)
             pos = auto.find_element((936 / 1920, 830 / 1080, 45 / 1920, 31 / 1080), "crop")
@@ -453,6 +457,65 @@ class CurrencyWars:
                 auto.click_element_with_pos(pos, cnt=10)
             log.error(f"选择敌人难度为1的关卡失败")
             return False
+
+    PURPLE_LEVEL = 30  # 紫金职级段对应的敌人难度（羁绊链路「紫金及以上职级」任务的最低要求）
+
+    def read_enemy_level(self) -> Optional[int]:
+        """OCR 关卡选择页左下角的敌人难度数字；读不出来返回 None。"""
+        crop = (440.0 / 1920, 892.0 / 1080, 385.0 / 1920, 137.0 / 1080)
+        try:
+            auto.take_screenshot(crop)
+            auto.perform_ocr()
+        except Exception as e:
+            log.error(f"截图/OCR 失败，读不了敌人难度：{e}")
+            return None
+        results = auto.ocr_result if isinstance(auto.ocr_result, list) else []
+        texts = []
+        for item in results:
+            try:
+                _, pair = item
+                txt = pair[0] if isinstance(pair, tuple) and len(pair) >= 1 else None
+            except (TypeError, ValueError):
+                txt = None
+            if isinstance(txt, str):
+                texts.append(txt)
+            elif txt is not None:
+                log.info(f"OCR 返回了非文本结果，已跳过：{txt!r}")
+        for t in texts:
+            m = re.search(r"\d{1,3}", t)
+            if m:
+                try:
+                    return int(m.group())
+                except ValueError:
+                    continue
+        log.info(f"未在难度区识别到数字（OCR: {texts[:3]}）")
+        return None
+
+    def choose_purple_level(self, max_steps: int = 80) -> bool:
+        """把关卡难度调到紫金职级段（敌人难度 30）：高于 30 就降，低了直接报错。"""
+        log.info(f"选择敌人难度为 {self.PURPLE_LEVEL} 的关卡（紫金职级）")
+        pos = auto.find_element((936 / 1920, 830 / 1080, 45 / 1920, 31 / 1080), "crop")
+        if pos is None:
+            log.error("未找到难度选择按钮，无法调整关卡难度")
+            return False
+        for step in range(max_steps):
+            level = self.read_enemy_level()
+            if level is not None:
+                if level == self.PURPLE_LEVEL:
+                    log.info(f"已选择敌人难度为 {level} 的关卡（紫金职级）")
+                    return True
+                if level < self.PURPLE_LEVEL:
+                    log.error(f"当前难度 {level} 已低于 {self.PURPLE_LEVEL}，职级不够，任务无法完成")
+                    return False
+            auto.click_element_with_pos(pos, cnt=10)
+            time.sleep(0.5)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        os.makedirs("./debug", exist_ok=True)
+        debug_path = f"./debug/currency_wars_purple_level_fail_{timestamp}.png"
+        auto.take_screenshot()
+        auto.screenshot.save(debug_path)
+        log.error(f"调整敌人难度到 {self.PURPLE_LEVEL} 失败，已保存调试截图至 {debug_path}")
+        return False
 
     def loop(self) -> bool:
         """
@@ -468,6 +531,8 @@ class CurrencyWars:
         self._stage_unchanged_count = 0  # 重置阶段未变化计数
         self._unrecognized_stage_count = 0  # 重置未识别阶段计数
         self.need_restart = False  # 是否需要重开
+        self.bond_emblems = {}  # 羁绊策略：本局已拿到的星徽（羁绊名 -> 个数），一个星徽可让该羁绊少凑一人
+        self._battle_since: Optional[float] = None  # 本场战斗开始时间，用来兜住「战斗永远打不完」
         self.forward_characters = []  # 重置前台角色
         self.backward_characters = []  # 重置后台角色
         self.prepare_characters = []  # 重置备战席角色
@@ -534,17 +599,22 @@ class CurrencyWars:
                 self.abort_run("货币战争连续5分钟未识别到可处理界面或战斗画面，停止任务")
             time.sleep(4)
 
+    def _detect_battle(self) -> bool:
+        """当前是否处于战斗画面（暂停图标或「敌方/我方行动中」文字），无副作用。"""
+        if auto.find_element("./assets/images/forgottenhall/pause.png", "image", 0.9):
+            return True
+        # 货币战争的暂停图标与忘却之庭模板不同，使用实际战斗状态文字兜底。
+        return bool(auto.find_element(("敌方行动中", "我方行动中"), "text", crop=(0.85, 0.89, 0.15, 0.08)))
+
     def check_battle_keepalive(self) -> bool:
         """仅在新截图确认战斗时，向云游戏发送低频、无按键的鼠标移动。"""
-        if not auto.find_element("./assets/images/forgottenhall/pause.png", "image", 0.9):
-            # 货币战争的暂停图标与忘却之庭模板不同，使用实际战斗状态文字兜底。
-            if not auto.find_element(("敌方行动中", "我方行动中"), "text", crop=(0.85, 0.89, 0.15, 0.08)):
-                return False
-            # 文字识别使用了局部截图，恢复完整截图用于下面的归一化坐标换算。
-            if not auto.take_screenshot():
-                return False
+        if not self._detect_battle():
+            return False
         if not cfg.cloud_game_enable:
             return True
+        # 文字/局部识别可能只留了裁剪图，重新截一张完整图用于归一化坐标换算。
+        if not auto.take_screenshot():
+            return False
 
         now = time.monotonic()
         if self._last_battle_keepalive is None:
@@ -648,6 +718,13 @@ class CurrencyWars:
                         log.info("首次获得希儿，立即出售多余角色")
                         self.sell_characters_seele_strategy()
 
+                elif cfg.currencywars_strategy == "bond_chain":
+                    # 羁绊链路策略：按官方羁绊表凑当前未完成的任务，见 currency_wars_bond.py
+                    self.mark_tracked_characters(self.prepare_characters, "准备席")
+                    self.mark_tracked_characters(self.forward_characters, "前台")
+                    self.mark_tracked_characters(self.backward_characters, "后台")
+                    bond_chain_step(self)
+
                 skip_buy_experience = False
                 if cfg.currencywars_strategy == "aglaea" and not self.allow_buy_experience:
                     skip_buy_experience = True
@@ -666,7 +743,8 @@ class CurrencyWars:
                 #     self.need_exit = False
                 #     return
 
-                self.sell_characters()
+                if cfg.currencywars_strategy != "bond_chain":
+                    self.sell_characters()  # 羁绊策略的成员不能卖
                 skip_equip_weapons = False
                 if cfg.currencywars_strategy == "aglaea" and not self.allow_equip_weapons:
                     skip_equip_weapons = True
@@ -1534,11 +1612,20 @@ class CurrencyWars:
                 return "forward"
             return item["c"].pos
 
-        def _build_assignment(forced_forward_names=None):
+        def _build_assignment(forced_forward_names=None, priority_forward=False):
             forced_forward_names = forced_forward_names or set()
 
             forward_candidates = [item for item in source_chars if _get_effective_pos(item, forced_forward_names) in ("forward", "all")]
-            forward_candidates.sort(key=lambda x: (-x["c"].money, 0 if _get_effective_pos(x, forced_forward_names) == "forward" else 1))
+            if priority_forward:
+                # 羁绊链路：被点名的角色要先占前台。只按费用排的话，1 费的
+                # 目标角色永远排在黄泉/彦卿这些高费无关角色后面，买到了也上不了场。
+                # 「前后台」通用的角色同费时和纯前台一视同仁——放前台能打又能凑人数。
+                forward_candidates.sort(key=lambda x: (
+                    0 if x["c"].name in forced_forward_names else 1,
+                    -x["c"].money,
+                    0 if _get_effective_pos(x, forced_forward_names) in ("forward", "all") else 1))
+            else:
+                forward_candidates.sort(key=lambda x: (-x["c"].money, 0 if _get_effective_pos(x, forced_forward_names) == "forward" else 1))
             top_forward: list[dict] = []
             top_forward_names: set[str] = set()
             duplicates_forward: list[dict] = []
@@ -1621,6 +1708,13 @@ class CurrencyWars:
             # 希儿策略下强制希儿为前台角色
             if self.has_tracked_character("希儿"):
                 all_chars, assigned, used = _build_assignment({"希儿"})
+
+        elif cfg.currencywars_strategy == "bond_chain":
+            # 羁绊链路：本局目标羁绊的成员必须上前台。羁绊人数虽然全场都算，
+            # 但技能和升星只看前台，留在备战席等于白买（1 费角色尤其吃亏）
+            push = getattr(self, "bond_push_forward", None)
+            if push:
+                all_chars, assigned, used = _build_assignment(set(push), priority_forward=True)
 
         # 无效优化，前台角色放后台不会自动使用技能，保持队伍中有角色空缺即可（好像能凑羁绊 也未必是无效优化，但是我懒得改了^_^）
         # # 补充逻辑：如果 forward 已满且 used < limit，从 prepare 移动角色到 backward
@@ -2002,8 +2096,22 @@ class CurrencyWars:
             self._unrecognized_stage_count = 0
             log.hr(f"当前阶段：{stage_text}", 2)
             if stage_text == self.current_stage:
-                self._stage_unchanged_count += 1
-                log.debug(f"当前阶段连续未变化次数：{self._stage_unchanged_count}")
+                if self._detect_battle():
+                    # 战斗画面里关卡编号本来就不变，打多久都算正常，不能累计成卡死；
+                    # 但一场战斗超过 15 分钟基本是打死循环了，这时恢复累计让卡死判定接管。
+                    now = time.monotonic()
+                    if self._battle_since is None:
+                        self._battle_since = now
+                    if now - self._battle_since < 900:
+                        self._stage_unchanged_count = 0
+                        log.debug("仍在战斗中，阶段未变化的计数清零")
+                    else:
+                        self._stage_unchanged_count += 1
+                        log.warning(f"战斗已持续超过 15 分钟，按卡死处理（{self._stage_unchanged_count}/5）")
+                else:
+                    self._battle_since = None
+                    self._stage_unchanged_count += 1
+                    log.debug(f"当前阶段连续未变化次数：{self._stage_unchanged_count}")
             else:
                 self._stage_unchanged_count = 0
             self.current_stage = stage_text
@@ -2459,6 +2567,9 @@ class CurrencyWars:
         # 特殊处理：如果识别到的名字是 "M"，则可能是识别错误导致的乱码，暂时视为未识别到角色
         if name == "M":
             name = None
+        # OCR 常见误读修正（羁绊策略维护的别名表；无策略时函数不存在则跳过）
+        if name and hasattr(self, "fix_ocr_name"):
+            name = self.fix_ocr_name(name)
 
         if name:
             # 检查缓存中是否已有该角色信息
@@ -2570,6 +2681,10 @@ class CurrencyWars:
         """
         if result := auto.find_element(("点击空白处继续", "下一步", "继续挑战", "前往结算", "下一页", "确认选择"), 'text', None, include=True):
             log.info(f"检测到{auto.matched_text}按钮，尝试点击")
+            # 战斗推进类按钮出现＝本节点有实质进展（多波战斗仍停在同一关卡编号），
+            # 把「阶段连续未变化」计数清零，避免长战斗被误判成卡死。
+            if auto.matched_text in ("继续挑战", "下一页", "前往结算", "点击空白处继续"):
+                self._stage_unchanged_count = 0
 
             # 某些结算直接通过“前往结算”离开，不会出现“下一页”。
             # 在点击前读取同一帧的结果，避免回到首页后只剩未知结果。
@@ -2735,6 +2850,26 @@ class CurrencyWars:
             ]
             option_texts = [self._get_ocr_texts_in_crop(pos) for pos in button_positions]
             has_choose = False
+
+            # 羁绊策略：把三个候选的原文打进日志，事后能复盘这一局到底拿了什么
+            if cfg.currencywars_strategy == "bond_chain":
+                for index, texts in enumerate(option_texts):
+                    log.info(f"投资环境候选{index + 1}：{' / '.join(t for t in texts[:8] if t) or '（未识别）'}")
+                # 优先拿本局目标羁绊相关的（概念股/邀请/星徽/契约），拿不到再走默认分支
+                if self.bond_target:
+                    wanted = tuple("%s%s" % (self.bond_target, suffix)
+                                   for suffix in ("概念股", "邀请", "星徽", "契约"))
+                    for index, texts in enumerate(option_texts):
+                        matched_text = self._find_text_in_texts(texts, wanted, include=True)
+                        if matched_text:
+                            auto.click_element(button_positions_click[index], 'crop')
+                            log.info(f"检测到{matched_text}选项（本局目标 {self.bond_target}），尝试点击")
+                            if matched_text.endswith("邀请"):
+                                bond_name = matched_text[:-2]
+                                self.bond_emblems[bond_name] = self.bond_emblems.get(bond_name, 0) + 1
+                                log.info(f"拿到【{bond_name}】星徽：该羁绊本局可少凑 1 人")
+                            has_choose = True
+                            break
 
             # 投资环境：
             # 昼之半神概念股：开局时获得【昼之半神】角色和初始简易装备，【昼之半神】角色的刷新概率提高。
@@ -3001,6 +3136,13 @@ class CurrencyWars:
             screen.wait_for_screen_change("currency_wars_homepage")
         if self.result is not None:
             log.info(f"本次对局结果：{'胜利' if self.result else '失败'}")
+            if cfg.currencywars_strategy == "bond_chain":
+                # 凑齐羁绊不等于通关：只有这局真的赢了才把进度记下来
+                try:
+                    from tasks.weekly.currency_wars_bond import commit_bond_result
+                    commit_bond_result(self, bool(self.result))
+                except Exception as e:
+                    log.debug(f"羁绊进度落盘失败：{e}")
         else:
             log.info("本次对局结果：未知")
         log.info("已返回货币战争首页")

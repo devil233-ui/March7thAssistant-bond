@@ -121,6 +121,10 @@ args = parse_args()
 
 import atexit
 import base64
+import ctypes
+import ctypes.wintypes
+import subprocess
+import threading
 import time
 
 if sys.platform == 'win32':
@@ -165,7 +169,8 @@ from tasks.base import screen_test
 
 
 from utils.console import pause_on_error, pause_on_success, pause_always, is_docker_started
-from utils.pause import pause_ctl
+from utils.pause import (pause_ctl, reset_files, write_command,
+                         COMMAND_PAUSE, COMMAND_RESUME)
 
 telemetry.init(
     enabled=cfg.get_value("telemetry_enable", True),
@@ -180,6 +185,149 @@ def first_run():
         log.error("首次使用请先打开图形界面 March7th Launcher")
         pause_always()
         sys.exit(0)
+
+
+_LOG_OVERLAY_PROC = None
+
+
+# ---------------------------------------------------------------- 运行控制热键
+# F9 暂停/恢复、F10 停止。全局热键由独立线程注册：RegisterHotKey(None, ...) 绑到该线程，
+# 消息只进它的队列，不会和主线程的自动化操作抢消息。
+_STOP_EVENT = threading.Event()
+_CURRENT_WAR = None
+_CONTROL_PATH = None          # 暂停控制文件路径，F9 通过写它下发指令
+CONTROL_HOTKEY_PAUSE = 0x78   # VK_F9
+CONTROL_HOTKEY_STOP = 0x79    # VK_F10
+
+
+class ControlHotkeys(threading.Thread):
+    """F9 暂停/恢复、F10 停止；游戏窗口在前台时也能用（全局热键）。"""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="M7AControlHotkeys")
+        self._stopped = threading.Event()
+        self._registered = []
+
+    def run(self):
+        user32 = ctypes.windll.user32
+        WM_HOTKEY, PM_REMOVE = 0x0312, 0x0001
+        for hotkey_id, vk in ((1, CONTROL_HOTKEY_PAUSE), (2, CONTROL_HOTKEY_STOP)):
+            if user32.RegisterHotKey(None, hotkey_id, 0, vk):
+                self._registered.append(hotkey_id)
+            else:
+                name = "F9" if vk == CONTROL_HOTKEY_PAUSE else "F10"
+                log.warning(f"{name} 热键注册失败（可能被其它程序占用）")
+        if not self._registered:
+            return
+        log.info("控制热键已就绪：F9 暂停/恢复，F10 停止")
+        try:
+            msg = ctypes.wintypes.MSG()
+            while not self._stopped.is_set():
+                if user32.PeekMessageW(ctypes.byref(msg), None, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
+                    if msg.message == WM_HOTKEY:
+                        self._handle(int(msg.wParam))
+                else:
+                    time.sleep(0.05)
+        finally:
+            for hotkey_id in self._registered:
+                user32.UnregisterHotKey(None, hotkey_id)
+
+    def _handle(self, hotkey_id: int):
+        if hotkey_id == 1:
+            # 必须写控制文件，不能只调 pause_ctl.request_pause()：
+            # 那个只改内存状态，而 watcher 线程每 0.3 秒读一次文件，
+            # 文件里还留着上一轮的 resume，会立刻把这次暂停撤掉（按了没反应）。
+            if not _CONTROL_PATH:
+                return
+            command = COMMAND_RESUME if pause_ctl.is_paused() else COMMAND_PAUSE
+            try:
+                write_command(_CONTROL_PATH, command)
+            except Exception as e:
+                log.error(f"写入暂停指令失败：{e}")
+        elif hotkey_id == 2:
+            # 停止键就该立刻停：走「放弃并结算」要等结算动画几分钟，这里直接退进程。
+            # 游戏留着不动，方便手动接着打或看结算。
+            log.warning("收到停止指令（F10），立即退出（游戏保留）")
+            _STOP_EVENT.set()
+            try:
+                stop_log_overlay()
+            except Exception:
+                pass
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                time.sleep(0.1)  # 给日志落盘留一点时间
+            except Exception:
+                pass
+            os._exit(0)
+
+    def stop(self):
+        self._stopped.set()
+
+
+def _kill_stale_overlay():
+    """清掉上一次残留的悬浮窗（手动起的、或上次被强杀没带走的），避免叠两个。"""
+    try:
+        import psutil
+        for proc in psutil.process_iter(attrs=["pid", "cmdline"]):
+            try:
+                cmdline = proc.info.get("cmdline") or []
+                if any("game_log_overlay.py" in str(part) for part in cmdline):
+                    proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+
+
+def start_log_overlay():
+    """拉起游戏内日志悬浮窗（独立进程）。
+
+    命令行跑任务时没有任何 GUI，日志只进控制台；游戏窗口一盖上来就看不到了。
+    `tools/game_log_overlay.py` 复刻了 GUI 里那个贴在游戏左下角的只读日志窗，
+    这里把它作为子进程带起来：主进程退出时一并结束，日志静默 10 分钟也会自退。
+    配置项 `log_overlay_enable` 设为 false 可关掉。
+    """
+    global _LOG_OVERLAY_PROC
+    if sys.platform != "win32" or _LOG_OVERLAY_PROC is not None:
+        return _LOG_OVERLAY_PROC
+    if not cfg.get_value("log_overlay_enable", True):
+        return None
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "game_log_overlay.py")
+    if not os.path.exists(script):
+        log.warning(f"未找到日志悬浮窗脚本，跳过：{script}")
+        return None
+    exe = sys.executable
+    if exe.endswith("python.exe"):  # 用 pythonw 才不会多弹一个控制台
+        windowless = exe[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(windowless):
+            exe = windowless
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        _kill_stale_overlay()
+        time.sleep(0.3)  # 让旧进程让出 Ctrl+Alt+L 热键
+        _LOG_OVERLAY_PROC = subprocess.Popen(
+            [exe, "-X", "utf8", script, "--exit-when-idle", "600"],
+            creationflags=flags,
+        )
+        log.info("日志悬浮窗已启动（Ctrl+Alt+L 切换显示/隐藏）")
+    except Exception as e:
+        log.warning(f"日志悬浮窗启动失败：{e}")
+        _LOG_OVERLAY_PROC = None
+    return _LOG_OVERLAY_PROC
+
+
+def stop_log_overlay():
+    """结束日志悬浮窗子进程（主进程收尾时调用）。"""
+    global _LOG_OVERLAY_PROC
+    if _LOG_OVERLAY_PROC is None:
+        return
+    try:
+        if _LOG_OVERLAY_PROC.poll() is None:
+            _LOG_OVERLAY_PROC.terminate()
+    except Exception:
+        pass
+    _LOG_OVERLAY_PROC = None
 
 
 def run_main_actions(no_run_immediately=False):
@@ -215,7 +363,7 @@ def run_sub_task(action):
         game.switch_to_game()
 
     def _run_loop_task_with_telemetry(task_id, task_fn):
-        while True:
+        while not _STOP_EVENT.is_set():
             telemetry.track_task_start(task_id)
             task_start_time = time.time()
             try:
@@ -224,11 +372,16 @@ def run_sub_task(action):
             except Exception:
                 telemetry.track_task_complete(task_id, False, time.time() - task_start_time)
                 raise
+        log.info("已按停止指令结束循环")
 
     def currencywars(mode=None):
+        global _CURRENT_WAR
         war = CurrencyWars()
-        if mode == "loop":
-            _run_loop_task_with_telemetry("currencywarsloop", war.start)
+        _CURRENT_WAR = war  # F10 停止时要能给这个实例打 need_exit
+        # 不带 loop 也默认一局接一局地跑（currencywars_loop_enable 设为 false 可还原成单局）
+        loop = mode == "loop" or (mode is None and cfg.get_value("currencywars_loop_enable", True))
+        if loop:
+            _run_loop_task_with_telemetry("currencywarsloop" if mode == "loop" else "currencywars", war.start)
         elif mode == "temp":
             war.loop()
         else:
@@ -334,8 +487,14 @@ def run_workflow_action(workflow_name: str, workflow_step_path=None):
 
 def main(action=None, no_run_immediately=False, workflow_name=None, workflow_step_path=None):
     first_run()
-    # 启动暂停控制器（仅在 GUI 注入了 MARCH7TH_CONTROL_FILE 时生效，其余场景惰性关闭）
-    pause_ctl.start()
+    # 启动暂停控制器：GUI 是用 MARCH7TH_CONTROL_FILE 注入路径的，命令行直跑时没有该变量，
+    # 这里落到程序目录下的控制文件，F9 暂停/恢复在 CLI 场景才有效
+    global _CONTROL_PATH
+    _CONTROL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".m7a_control.json")
+    reset_files(_CONTROL_PATH)  # 清掉上一次残留的 pause 指令，否则一启动就停着
+    pause_ctl.start(control_path=_CONTROL_PATH)
+    ControlHotkeys().start()
+    start_log_overlay()
     telemetry.track_startup()
 
     if workflow_name:
@@ -383,6 +542,7 @@ def exit_handler():
     """注册程序退出时的处理函数，用于清理OCR和调试资源."""
     telemetry.shutdown()
     ocr.exit_ocr()
+    stop_log_overlay()
     # 清理调试叠加层
     try:
         from module.automation import auto
